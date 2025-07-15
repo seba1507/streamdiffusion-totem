@@ -127,7 +127,7 @@ class UltraFastDiffusion:
                         _ = self.pipe(
                             "test",
                             image=dummy_image,
-                            num_inference_steps=1,
+                            num_inference_steps=2,
                             strength=0.2,
                             guidance_scale=0.0
                         ).images[0]
@@ -135,7 +135,7 @@ class UltraFastDiffusion:
                     _ = self.pipe(
                         "test",
                         image=dummy_image,
-                        num_inference_steps=1,
+                        num_inference_steps=2,
                         strength=0.2,
                         guidance_scale=0.0
                     ).images[0]
@@ -224,7 +224,7 @@ class UltraFastDiffusion:
                                     result = self.pipe(
                                         prompt=frame_data['prompt'],
                                         image=frame_data['image'],
-                                        num_inference_steps=1,
+                                        num_inference_steps=2,
                                         strength=0.2,
                                         guidance_scale=0.0,
                                         generator=torch.Generator(device=self.device).manual_seed(42)
@@ -233,7 +233,7 @@ class UltraFastDiffusion:
                                 result = self.pipe(
                                     prompt=frame_data['prompt'],
                                     image=frame_data['image'],
-                                    num_inference_steps=1,
+                                    num_inference_steps=2,
                                     strength=0.2,
                                     guidance_scale=0.0,
                                     generator=torch.Generator(device=self.device).manual_seed(42)
@@ -243,7 +243,7 @@ class UltraFastDiffusion:
                             result = self.pipe(
                                 prompt=frame_data['prompt'],
                                 image=frame_data['image'],
-                                num_inference_steps=1,
+                                num_inference_steps=2,
                                 strength=0.2,
                                 guidance_scale=0.0
                             ).images[0]
