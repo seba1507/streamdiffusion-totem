@@ -92,13 +92,12 @@ class UltraFastDiffusion:
         compile_enabled = False
         if not xformers_enabled:
             try:
-                # Configurar torch._dynamo para manejar errores
                 torch._dynamo.config.suppress_errors = True
                 
                 self.pipe.unet = torch.compile(
                     self.pipe.unet, 
                     mode="reduce-overhead", 
-                    fullgraph=False  # Usar fullgraph=False para mejor compatibilidad
+                    fullgraph=False
                 )
                 compile_enabled = True
                 print("✓ UNet compilado con torch.compile")
@@ -107,7 +106,7 @@ class UltraFastDiffusion:
         else:
             print("⚠ torch.compile deshabilitado (conflicto con XFormers)")
         
-        # VAE optimizations - estas son siempre seguras
+        # VAE optimizations
         try:
             self.pipe.vae.enable_slicing()
             self.pipe.vae.enable_tiling()
@@ -121,14 +120,13 @@ class UltraFastDiffusion:
         
         try:
             with torch.no_grad():
-                # No usar autocast si hay problemas de compatibilidad
                 if xformers_enabled or compile_enabled:
                     with torch.cuda.amp.autocast():
                         _ = self.pipe(
                             "test",
                             image=dummy_image,
                             num_inference_steps=2,
-                            strength=0.2,
+                            strength=0.8,
                             guidance_scale=0.0
                         ).images[0]
                 else:
@@ -136,7 +134,7 @@ class UltraFastDiffusion:
                         "test",
                         image=dummy_image,
                         num_inference_steps=2,
-                        strength=0.2,
+                        strength=0.8,
                         guidance_scale=0.0
                     ).images[0]
             print("✓ Pre-calentamiento exitoso")
@@ -166,7 +164,7 @@ class UltraFastDiffusion:
             img_array = np.array(small_img)
             return hashlib.md5(img_array.tobytes()).hexdigest()
         except Exception:
-            return str(time.time())  # Fallback básico
+            return str(time.time())
     
     def should_skip_frame(self, image):
         """Implementar similarity filter"""
@@ -185,7 +183,7 @@ class UltraFastDiffusion:
             self.frame_skip_counter = 0
             return False
         except Exception:
-            return False  # En caso de error, no saltar frame
+            return False
     
     def start_processing_thread(self):
         """Iniciar thread de procesamiento continuo"""
@@ -193,6 +191,18 @@ class UltraFastDiffusion:
         processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
         processing_thread.start()
         print("✓ Thread de procesamiento iniciado")
+    
+    def calculate_optimal_steps(self, strength):
+        """Calcular pasos óptimos basado en strength para SD-Turbo"""
+        # Para SD-Turbo: num_inference_steps * strength debe ser >= 1
+        if strength >= 1.0:
+            return 1
+        elif strength >= 0.5:
+            return 2
+        elif strength >= 0.25:
+            return 4
+        else:
+            return max(1, int(1.0 / strength))
     
     def _processing_loop(self):
         """Loop principal de procesamiento en thread separado"""
@@ -213,10 +223,16 @@ class UltraFastDiffusion:
                         pass
                     continue
                 
-                # Generar con SD-Turbo - configuración ultra-conservadora
+                # Calcular pasos óptimos basado en strength
+                strength = frame_data.get('strength', 0.8)
+                steps = self.calculate_optimal_steps(strength)
+                guidance_scale = frame_data.get('guidance_scale', 0.0)
+                
+                print(f"Procesando: strength={strength}, steps={steps}, guidance={guidance_scale}")
+                
+                # Generar con SD-Turbo
                 try:
                     with torch.no_grad():
-                        # Usar autocast solo si no hay conflictos
                         use_autocast = True
                         try:
                             if use_autocast:
@@ -224,18 +240,18 @@ class UltraFastDiffusion:
                                     result = self.pipe(
                                         prompt=frame_data['prompt'],
                                         image=frame_data['image'],
-                                        num_inference_steps=2,
-                                        strength=0.2,
-                                        guidance_scale=0.0,
+                                        num_inference_steps=steps,
+                                        strength=strength,
+                                        guidance_scale=guidance_scale,
                                         generator=torch.Generator(device=self.device).manual_seed(42)
                                     ).images[0]
                             else:
                                 result = self.pipe(
                                     prompt=frame_data['prompt'],
                                     image=frame_data['image'],
-                                    num_inference_steps=2,
-                                    strength=0.2,
-                                    guidance_scale=0.0,
+                                    num_inference_steps=steps,
+                                    strength=strength,
+                                    guidance_scale=guidance_scale,
                                     generator=torch.Generator(device=self.device).manual_seed(42)
                                 ).images[0]
                         except Exception as autocast_error:
@@ -243,9 +259,9 @@ class UltraFastDiffusion:
                             result = self.pipe(
                                 prompt=frame_data['prompt'],
                                 image=frame_data['image'],
-                                num_inference_steps=2,
-                                strength=0.2,
-                                guidance_scale=0.0
+                                num_inference_steps=steps,
+                                strength=strength,
+                                guidance_scale=guidance_scale
                             ).images[0]
                     
                     processing_time = (time.time() - start_time) * 1000
@@ -258,7 +274,10 @@ class UltraFastDiffusion:
                         'stats': {
                             'total_frames': self.total_frames,
                             'skipped_frames': self.skipped_frames,
-                            'skip_rate': self.skipped_frames / max(1, self.total_frames) * 100
+                            'skip_rate': self.skipped_frames / max(1, self.total_frames) * 100,
+                            'strength': strength,
+                            'steps': steps,
+                            'guidance_scale': guidance_scale
                         }
                     }
                     
@@ -271,7 +290,7 @@ class UltraFastDiffusion:
                         except:
                             pass
                             
-                    print(f"Frame procesado: {processing_time:.1f}ms (Skip rate: {self.skipped_frames}/{self.total_frames})")
+                    print(f"Frame procesado: {processing_time:.1f}ms (Strength: {strength}, Steps: {steps})")
                     
                 except Exception as process_error:
                     print(f"Error procesando frame: {process_error}")
@@ -283,11 +302,13 @@ class UltraFastDiffusion:
                 print(f"Error en processing loop: {e}")
                 continue
     
-    def add_frame(self, image, prompt, timestamp):
-        """Agregar frame para procesamiento (non-blocking)"""
+    def add_frame(self, image, prompt, strength, guidance_scale, timestamp):
+        """Agregar frame para procesamiento con parámetros ajustables"""
         frame_data = {
             'image': image,
             'prompt': prompt,
+            'strength': strength,
+            'guidance_scale': guidance_scale,
             'timestamp': timestamp
         }
         
@@ -313,12 +334,12 @@ class UltraFastDiffusion:
 # Instancia global
 processor = UltraFastDiffusion()
 
-# HTML optimizado y simplificado
+# HTML con controles avanzados
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Ultra Fast SD-Turbo Stream</title>
+    <title>SD-Turbo Controls - Ultra Fast Stream</title>
     <style>
         body {
             margin: 0;
@@ -347,15 +368,28 @@ HTML_CONTENT = """
         .controls {
             position: fixed;
             bottom: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: rgba(0,0,0,0.9);
+            left: 20px;
+            right: 20px;
+            background: rgba(0,0,0,0.95);
             padding: 20px;
             border-radius: 15px;
-            display: flex;
-            gap: 15px;
-            align-items: center;
             border: 1px solid #00ff41;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .control-label {
+            color: #00ff41;
+            font-weight: bold;
+            font-size: 12px;
+            text-transform: uppercase;
         }
         button {
             padding: 12px 24px;
@@ -379,35 +413,64 @@ HTML_CONTENT = """
             transform: none;
             box-shadow: none;
         }
-        select {
-            padding: 12px;
-            font-size: 16px;
-            border-radius: 8px;
+        select, input[type="range"], input[type="text"], textarea {
+            padding: 8px 12px;
+            font-size: 14px;
+            border-radius: 6px;
             background: #222;
             color: #fff;
             border: 1px solid #00ff41;
+            font-family: 'Consolas', monospace;
+        }
+        input[type="range"] {
+            height: 6px;
+            -webkit-appearance: none;
+            background: #333;
+            outline: none;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 20px;
+            height: 20px;
+            background: #00ff41;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+        textarea {
+            resize: vertical;
+            min-height: 60px;
+            max-height: 120px;
+        }
+        .range-value {
+            color: #00ff41;
+            font-weight: bold;
+            text-align: center;
+            font-size: 16px;
         }
         .stats {
             position: fixed;
             top: 20px;
             right: 20px;
-            background: rgba(0,0,0,0.9);
+            background: rgba(0,0,0,0.95);
             padding: 20px;
             border-radius: 15px;
             font-family: 'Consolas', monospace;
-            font-size: 14px;
+            font-size: 12px;
             border: 1px solid #00ff41;
             min-width: 250px;
+            max-height: 400px;
+            overflow-y: auto;
         }
         .stat-value {
             color: #00ff41;
             font-weight: bold;
-            font-size: 16px;
         }
         .stat-row {
             display: flex;
             justify-content: space-between;
-            margin: 8px 0;
+            margin: 6px 0;
+            border-bottom: 1px solid #333;
+            padding-bottom: 4px;
         }
         .status-indicator {
             position: absolute;
@@ -425,10 +488,30 @@ HTML_CONTENT = """
         }
         .title {
             text-align: center;
-            margin-bottom: 10px;
+            margin-bottom: 15px;
             color: #00ff41;
-            font-size: 18px;
+            font-size: 16px;
             font-weight: bold;
+            text-transform: uppercase;
+        }
+        .preset-buttons {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .preset-btn {
+            padding: 6px 12px;
+            font-size: 12px;
+            background: #333;
+            color: #fff;
+            border: 1px solid #666;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .preset-btn:hover {
+            background: #555;
+            border-color: #00ff41;
         }
     </style>
 </head>
@@ -442,7 +525,7 @@ HTML_CONTENT = """
     </div>
     
     <div class="stats">
-        <div class="title">SD-TURBO METRICS</div>
+        <div class="title">Métricas en Tiempo Real</div>
         <div class="stat-row">
             <span>FPS:</span>
             <span id="fps" class="stat-value">0</span>
@@ -459,19 +542,54 @@ HTML_CONTENT = """
             <span>Skip Rate:</span>
             <span id="skipRate" class="stat-value">0</span>%
         </div>
+        <div class="stat-row">
+            <span>Strength Actual:</span>
+            <span id="currentStrength" class="stat-value">0.8</span>
+        </div>
+        <div class="stat-row">
+            <span>Pasos Calculados:</span>
+            <span id="currentSteps" class="stat-value">2</span>
+        </div>
+        <div class="stat-row">
+            <span>Guidance Scale:</span>
+            <span id="currentGuidance" class="stat-value">0.0</span>
+        </div>
     </div>
     
     <div class="controls">
-        <button id="startBtn" onclick="start()">🚀 INICIAR TURBO</button>
-        <button id="stopBtn" onclick="stop()" disabled>⏹ DETENER</button>
-        <select id="style">
-            <option value="">Fotorealista</option>
-            <option value="cyberpunk futuristic">Cyberpunk</option>
-            <option value="anime style">Anime</option>
-            <option value="oil painting masterpiece">Óleo</option>
-            <option value="watercolor painting">Acuarela</option>
-            <option value="digital art">Arte Digital</option>
-        </select>
+        <div class="control-group">
+            <div class="control-label">Estado del Sistema</div>
+            <button id="startBtn" onclick="start()">🚀 INICIAR TURBO</button>
+            <button id="stopBtn" onclick="stop()" disabled>⏹ DETENER</button>
+        </div>
+        
+        <div class="control-group">
+            <div class="control-label">Prompt Personalizado</div>
+            <textarea id="customPrompt" placeholder="Escribe tu prompt aquí... (ej: cyberpunk style, neon lights, futuristic)">cyberpunk style, neon lights, high quality, detailed</textarea>
+        </div>
+        
+        <div class="control-group">
+            <div class="control-label">Presets Rápidos</div>
+            <div class="preset-buttons">
+                <button class="preset-btn" onclick="setPreset('', 0.5, 0.0)">Original</button>
+                <button class="preset-btn" onclick="setPreset('cyberpunk style, neon lights', 0.8, 1.0)">Cyberpunk</button>
+                <button class="preset-btn" onclick="setPreset('anime style, manga', 0.7, 1.5)">Anime</button>
+                <button class="preset-btn" onclick="setPreset('oil painting masterpiece', 0.9, 2.0)">Óleo</button>
+                <button class="preset-btn" onclick="setPreset('watercolor painting, artistic', 0.6, 1.0)">Acuarela</button>
+            </div>
+        </div>
+        
+        <div class="control-group">
+            <div class="control-label">Strength (Intensidad)</div>
+            <input type="range" id="strengthSlider" min="0.1" max="1.0" step="0.1" value="0.8" oninput="updateStrengthValue()">
+            <div class="range-value" id="strengthValue">0.8</div>
+        </div>
+        
+        <div class="control-group">
+            <div class="control-label">Guidance Scale</div>
+            <input type="range" id="guidanceSlider" min="0.0" max="3.0" step="0.1" value="0.0" oninput="updateGuidanceValue()">
+            <div class="range-value" id="guidanceValue">0.0</div>
+        </div>
     </div>
     
     <script>
@@ -485,6 +603,24 @@ HTML_CONTENT = """
         let totalFrames = 0;
         let lastTime = Date.now();
         let latencies = [];
+        
+        function updateStrengthValue() {
+            const value = document.getElementById('strengthSlider').value;
+            document.getElementById('strengthValue').textContent = value;
+        }
+        
+        function updateGuidanceValue() {
+            const value = document.getElementById('guidanceSlider').value;
+            document.getElementById('guidanceValue').textContent = value;
+        }
+        
+        function setPreset(prompt, strength, guidance) {
+            document.getElementById('customPrompt').value = prompt;
+            document.getElementById('strengthSlider').value = strength;
+            document.getElementById('guidanceSlider').value = guidance;
+            updateStrengthValue();
+            updateGuidanceValue();
+        }
         
         async function start() {
             try {
@@ -561,30 +697,39 @@ HTML_CONTENT = """
             tempCanvas.height = 512;
             const tempCtx = tempCanvas.getContext('2d');
             
+            // Fit por altura - cortar lados si es necesario
             const videoAspect = video.videoWidth / video.videoHeight;
+            const targetAspect = 1; // 512/512 = 1
+            
             let sx, sy, sw, sh;
             
-            if (videoAspect > 1) {
-                sw = video.videoHeight;
+            if (videoAspect > targetAspect) {
+                // Video más ancho que el target - cortar lados
                 sh = video.videoHeight;
+                sw = video.videoHeight; // Hacer cuadrado
                 sx = (video.videoWidth - sw) / 2;
                 sy = 0;
             } else {
+                // Video más alto que el target - cortar arriba/abajo
                 sw = video.videoWidth;
-                sh = video.videoWidth;
+                sh = video.videoWidth; // Hacer cuadrado
                 sx = 0;
                 sy = (video.videoHeight - sh) / 2;
             }
             
             tempCtx.drawImage(video, sx, sy, sw, sh, 0, 0, 512, 512);
             
-            const style = document.getElementById('style').value;
-            let prompt = style ? `${style}, high quality, detailed` : "high quality, detailed, photorealistic";
+            // Obtener parámetros de la interfaz
+            const prompt = document.getElementById('customPrompt').value || "high quality, detailed";
+            const strength = parseFloat(document.getElementById('strengthSlider').value);
+            const guidance = parseFloat(document.getElementById('guidanceSlider').value);
             
-            const imageData = tempCanvas.toDataURL('image/jpeg', 0.9);
+            const imageData = tempCanvas.toDataURL('image/jpeg', 0.95);
             ws.send(JSON.stringify({
                 image: imageData,
                 prompt: prompt,
+                strength: strength,
+                guidance_scale: guidance,
                 timestamp: Date.now()
             }));
             
@@ -615,6 +760,9 @@ HTML_CONTENT = """
             if (data.stats) {
                 document.getElementById('totalFrames').textContent = data.stats.total_frames;
                 document.getElementById('skipRate').textContent = data.stats.skip_rate.toFixed(1);
+                document.getElementById('currentStrength').textContent = data.stats.strength;
+                document.getElementById('currentSteps').textContent = data.stats.steps;
+                document.getElementById('currentGuidance').textContent = data.stats.guidance_scale;
             }
         }
         
@@ -653,7 +801,7 @@ async def get():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("🚀 Cliente conectado - SD-Turbo estable")
+    print("🚀 Cliente conectado - SD-Turbo con controles avanzados")
     
     try:
         while True:
@@ -665,15 +813,27 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 img_data = base64.b64decode(data['image'].split(',')[1])
                 input_image = Image.open(io.BytesIO(img_data)).convert("RGB")
-                input_image = input_image.resize((512, 512), Image.Resampling.LANCZOS)
+                
+                # Asegurar que la imagen sea exactamente 512x512
+                if input_image.size != (512, 512):
+                    input_image = input_image.resize((512, 512), Image.Resampling.LANCZOS)
+                
+                print(f"Imagen recibida: {input_image.size}")
                 
             except Exception as e:
                 print(f"❌ Error decodificando imagen: {e}")
                 continue
             
+            # Extraer parámetros del cliente
+            prompt = data.get('prompt', 'high quality, detailed')
+            strength = data.get('strength', 0.8)
+            guidance_scale = data.get('guidance_scale', 0.0)
+            
             processor.add_frame(
                 input_image, 
-                data.get('prompt', 'high quality, detailed'),
+                prompt,
+                strength,
+                guidance_scale,
                 data.get('timestamp', time.time() * 1000)
             )
             
@@ -681,7 +841,7 @@ async def websocket_endpoint(websocket: WebSocket):
             
             if result:
                 buffered = io.BytesIO()
-                result['image'].save(buffered, format="JPEG", quality=90)
+                result['image'].save(buffered, format="JPEG", quality=95)
                 img_str = base64.b64encode(buffered.getvalue()).decode()
                 
                 await websocket.send_json({
@@ -700,11 +860,12 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*70)
-    print("🚀 SD-TURBO STREAM SERVER (VERSIÓN ESTABLE)")
+    print("🎛️ SD-TURBO STREAM CON CONTROLES AVANZADOS")
     print("="*70)
-    print("⚡ SD-Turbo con 1 paso de inferencia")
-    print("🛡️ Manejo robusto de compatibilidad")
-    print("🎯 Similarity filter activo")
+    print("⚡ SD-Turbo con ajustes dinámicos")
+    print("🎚️ Controles de Strength y Guidance Scale")
+    print("✏️ Prompt personalizable en tiempo real")
+    print("📐 Video ajustado a 512x512 (fit por altura)")
     print("🌐 URL: http://0.0.0.0:8000")
     print("="*70 + "\n")
     
