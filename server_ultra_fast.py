@@ -46,18 +46,14 @@ class UltraFastDiffusion:
         self.dtype = torch.float16
         
         # Stream processing optimizations
-        self.frame_queue = queue.Queue(maxsize=2)  # Pequeño buffer para evitar latencia
+        self.frame_queue = queue.Queue(maxsize=2)
         self.result_queue = queue.Queue(maxsize=3)
         self.processing = False
         
-        # Similarity filter (inspirado en dotsimulate)
+        # Similarity filter
         self.last_image_hash = None
         self.similarity_threshold = 0.95
         self.frame_skip_counter = 0
-        
-        # Temporal smoothing
-        self.last_latent = None
-        self.latent_momentum = 0.3  # Factor de suavizado
         
         # Performance metrics
         self.total_frames = 0
@@ -68,7 +64,6 @@ class UltraFastDiffusion:
     def init_model(self):
         print("Cargando SD-Turbo optimizado...")
         
-        # SD-Turbo: modelo diseñado para 1 paso
         model_id = "stabilityai/sd-turbo"
         
         self.pipe = AutoPipelineForImage2Image.from_pretrained(
@@ -81,72 +76,116 @@ class UltraFastDiffusion:
         
         self.pipe = self.pipe.to(self.device)
         
-        # Optimizaciones críticas
+        # Optimizaciones graduales con manejo de errores
         self.pipe.set_progress_bar_config(disable=True)
         
-        # XFormers para eficiencia de memoria
+        # Intentar XFormers primero
+        xformers_enabled = False
         try:
             self.pipe.enable_xformers_memory_efficient_attention()
+            xformers_enabled = True
             print("✓ XFormers habilitado")
-        except:
-            print("⚠ XFormers no disponible")
+        except Exception as e:
+            print(f"⚠ XFormers no disponible: {e}")
         
-        # Compilación con torch.compile para máxima velocidad
+        # Compilación de torch.compile - solo si XFormers no está habilitado
+        compile_enabled = False
+        if not xformers_enabled:
+            try:
+                # Configurar torch._dynamo para manejar errores
+                torch._dynamo.config.suppress_errors = True
+                
+                self.pipe.unet = torch.compile(
+                    self.pipe.unet, 
+                    mode="reduce-overhead", 
+                    fullgraph=False  # Usar fullgraph=False para mejor compatibilidad
+                )
+                compile_enabled = True
+                print("✓ UNet compilado con torch.compile")
+            except Exception as e:
+                print(f"⚠ torch.compile no disponible: {e}")
+        else:
+            print("⚠ torch.compile deshabilitado (conflicto con XFormers)")
+        
+        # VAE optimizations - estas son siempre seguras
         try:
-            self.pipe.unet = torch.compile(
-                self.pipe.unet, 
-                mode="reduce-overhead", 
-                fullgraph=True
-            )
-            print("✓ UNet compilado con torch.compile")
-        except:
-            print("⚠ torch.compile no disponible")
+            self.pipe.vae.enable_slicing()
+            self.pipe.vae.enable_tiling()
+            print("✓ VAE optimizado (slicing + tiling)")
+        except Exception as e:
+            print(f"⚠ Optimizaciones VAE fallaron: {e}")
         
-        # VAE optimizations
-        self.pipe.vae.enable_slicing()
-        self.pipe.vae.enable_tiling()
-        
-        # Pre-calentar con imagen dummy
+        # Pre-calentar con configuración segura
         print("Pre-calentando pipeline...")
         dummy_image = Image.new('RGB', (512, 512), color='black')
-        with torch.no_grad():
-            with torch.cuda.amp.autocast():
-                _ = self.pipe(
-                    "test",
-                    image=dummy_image,
-                    num_inference_steps=1,
-                    strength=1.0,  # Para asegurar que steps * strength >= 1
-                    guidance_scale=0.0  # SD-Turbo no usa guidance
-                ).images[0]
         
-        print("✓ Modelo listo para ultra-velocidad!")
+        try:
+            with torch.no_grad():
+                # No usar autocast si hay problemas de compatibilidad
+                if xformers_enabled or compile_enabled:
+                    with torch.cuda.amp.autocast():
+                        _ = self.pipe(
+                            "test",
+                            image=dummy_image,
+                            num_inference_steps=1,
+                            strength=1.0,
+                            guidance_scale=0.0
+                        ).images[0]
+                else:
+                    _ = self.pipe(
+                        "test",
+                        image=dummy_image,
+                        num_inference_steps=1,
+                        strength=1.0,
+                        guidance_scale=0.0
+                    ).images[0]
+            print("✓ Pre-calentamiento exitoso")
+        except Exception as e:
+            print(f"⚠ Error en pre-calentamiento: {e}")
+            print("Continuando sin pre-calentamiento...")
+        
+        print("✓ Modelo listo!")
+        
+        # Performance summary
+        optimizations = []
+        if xformers_enabled:
+            optimizations.append("XFormers")
+        if compile_enabled:
+            optimizations.append("torch.compile")
+        optimizations.append("VAE optimizado")
+        
+        print(f"Optimizaciones activas: {', '.join(optimizations)}")
         
         # Iniciar thread de procesamiento
         self.start_processing_thread()
     
     def calculate_image_hash(self, image):
         """Calcular hash rápido de imagen para similarity filter"""
-        # Redimensionar a 64x64 para hash rápido
-        small_img = image.resize((64, 64))
-        img_array = np.array(small_img)
-        return hashlib.md5(img_array.tobytes()).hexdigest()
+        try:
+            small_img = image.resize((64, 64))
+            img_array = np.array(small_img)
+            return hashlib.md5(img_array.tobytes()).hexdigest()
+        except Exception:
+            return str(time.time())  # Fallback básico
     
     def should_skip_frame(self, image):
-        """Implementar similarity filter como dotsimulate"""
-        current_hash = self.calculate_image_hash(image)
-        
-        if self.last_image_hash is None:
+        """Implementar similarity filter"""
+        try:
+            current_hash = self.calculate_image_hash(image)
+            
+            if self.last_image_hash is None:
+                self.last_image_hash = current_hash
+                return False
+            
+            if current_hash == self.last_image_hash:
+                self.frame_skip_counter += 1
+                return True
+            
             self.last_image_hash = current_hash
+            self.frame_skip_counter = 0
             return False
-        
-        # Calcular similitud simple basada en hash
-        if current_hash == self.last_image_hash:
-            self.frame_skip_counter += 1
-            return True
-        
-        self.last_image_hash = current_hash
-        self.frame_skip_counter = 0
-        return False
+        except Exception:
+            return False  # En caso de error, no saltar frame
     
     def start_processing_thread(self):
         """Iniciar thread de procesamiento continuo"""
@@ -159,15 +198,13 @@ class UltraFastDiffusion:
         """Loop principal de procesamiento en thread separado"""
         while self.processing:
             try:
-                # Obtener próximo frame (timeout corto para responsividad)
                 frame_data = self.frame_queue.get(timeout=0.1)
                 
                 start_time = time.time()
                 
-                # Similarity filter - skip si es muy similar al anterior
+                # Similarity filter
                 if self.should_skip_frame(frame_data['image']):
                     self.skipped_frames += 1
-                    # Reenviar último resultado si existe
                     try:
                         last_result = self.result_queue.queue[-1] if self.result_queue.queue else None
                         if last_result:
@@ -176,45 +213,69 @@ class UltraFastDiffusion:
                         pass
                     continue
                 
-                # Generar con SD-Turbo optimizado
-                with torch.no_grad():
-                    with torch.cuda.amp.autocast():
-                        result = self.pipe(
-                            prompt=frame_data['prompt'],
-                            image=frame_data['image'],
-                            num_inference_steps=1,  # SD-Turbo: 1 paso óptimo
-                            strength=1.0,  # Para asegurar steps * strength >= 1
-                            guidance_scale=0.0,  # SD-Turbo no usa guidance
-                            generator=torch.Generator(device=self.device).manual_seed(42)  # Seed fijo para consistencia
-                        ).images[0]
-                
-                processing_time = (time.time() - start_time) * 1000
-                self.total_frames += 1
-                
-                # Agregar resultado a cola de salida
-                result_data = {
-                    'image': result,
-                    'processing_time': processing_time,
-                    'timestamp': frame_data['timestamp'],
-                    'stats': {
-                        'total_frames': self.total_frames,
-                        'skipped_frames': self.skipped_frames,
-                        'skip_rate': self.skipped_frames / max(1, self.total_frames) * 100
-                    }
-                }
-                
-                # Usar put_nowait para evitar bloqueos
+                # Generar con SD-Turbo - configuración ultra-conservadora
                 try:
-                    self.result_queue.put_nowait(result_data)
-                except queue.Full:
-                    # Si la cola está llena, remover el más viejo
+                    with torch.no_grad():
+                        # Usar autocast solo si no hay conflictos
+                        use_autocast = True
+                        try:
+                            if use_autocast:
+                                with torch.cuda.amp.autocast():
+                                    result = self.pipe(
+                                        prompt=frame_data['prompt'],
+                                        image=frame_data['image'],
+                                        num_inference_steps=1,
+                                        strength=1.0,
+                                        guidance_scale=0.0,
+                                        generator=torch.Generator(device=self.device).manual_seed(42)
+                                    ).images[0]
+                            else:
+                                result = self.pipe(
+                                    prompt=frame_data['prompt'],
+                                    image=frame_data['image'],
+                                    num_inference_steps=1,
+                                    strength=1.0,
+                                    guidance_scale=0.0,
+                                    generator=torch.Generator(device=self.device).manual_seed(42)
+                                ).images[0]
+                        except Exception as autocast_error:
+                            print(f"Autocast falló, usando modo estándar: {autocast_error}")
+                            result = self.pipe(
+                                prompt=frame_data['prompt'],
+                                image=frame_data['image'],
+                                num_inference_steps=1,
+                                strength=1.0,
+                                guidance_scale=0.0
+                            ).images[0]
+                    
+                    processing_time = (time.time() - start_time) * 1000
+                    self.total_frames += 1
+                    
+                    result_data = {
+                        'image': result,
+                        'processing_time': processing_time,
+                        'timestamp': frame_data['timestamp'],
+                        'stats': {
+                            'total_frames': self.total_frames,
+                            'skipped_frames': self.skipped_frames,
+                            'skip_rate': self.skipped_frames / max(1, self.total_frames) * 100
+                        }
+                    }
+                    
                     try:
-                        self.result_queue.get_nowait()
                         self.result_queue.put_nowait(result_data)
-                    except:
-                        pass
-                        
-                print(f"Frame procesado: {processing_time:.1f}ms (Skip rate: {self.skipped_frames}/{self.total_frames})")
+                    except queue.Full:
+                        try:
+                            self.result_queue.get_nowait()
+                            self.result_queue.put_nowait(result_data)
+                        except:
+                            pass
+                            
+                    print(f"Frame procesado: {processing_time:.1f}ms (Skip rate: {self.skipped_frames}/{self.total_frames})")
+                    
+                except Exception as process_error:
+                    print(f"Error procesando frame: {process_error}")
+                    continue
                 
             except queue.Empty:
                 continue
@@ -233,7 +294,6 @@ class UltraFastDiffusion:
         try:
             self.frame_queue.put_nowait(frame_data)
         except queue.Full:
-            # Si está lleno, remover el más viejo y agregar el nuevo
             try:
                 self.frame_queue.get_nowait()
                 self.frame_queue.put_nowait(frame_data)
@@ -243,7 +303,6 @@ class UltraFastDiffusion:
     def get_latest_result(self):
         """Obtener resultado más reciente (non-blocking)"""
         result = None
-        # Vaciar cola y quedarse con el último
         while not self.result_queue.empty():
             try:
                 result = self.result_queue.get_nowait()
@@ -254,7 +313,7 @@ class UltraFastDiffusion:
 # Instancia global
 processor = UltraFastDiffusion()
 
-# HTML optimizado con smoothing visual
+# HTML optimizado y simplificado
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html>
@@ -364,14 +423,6 @@ HTML_CONTENT = """
             background: #00ff41;
             box-shadow: 0 0 15px #00ff41;
         }
-        .performance-graph {
-            margin-top: 15px;
-            height: 60px;
-            border: 1px solid #333;
-            background: #111;
-            position: relative;
-            overflow: hidden;
-        }
         .title {
             text-align: center;
             margin-bottom: 10px;
@@ -391,7 +442,7 @@ HTML_CONTENT = """
     </div>
     
     <div class="stats">
-        <div class="title">ULTRA FAST METRICS</div>
+        <div class="title">SD-TURBO METRICS</div>
         <div class="stat-row">
             <span>FPS:</span>
             <span id="fps" class="stat-value">0</span>
@@ -405,16 +456,8 @@ HTML_CONTENT = """
             <span id="totalFrames" class="stat-value">0</span>
         </div>
         <div class="stat-row">
-            <span>Frames Saltados:</span>
-            <span id="skippedFrames" class="stat-value">0</span>
-        </div>
-        <div class="stat-row">
             <span>Skip Rate:</span>
             <span id="skipRate" class="stat-value">0</span>%
-        </div>
-        <div class="stat-row">
-            <span>GPU Efficiency:</span>
-            <span id="efficiency" class="stat-value">0</span>%
         </div>
     </div>
     
@@ -428,7 +471,6 @@ HTML_CONTENT = """
             <option value="oil painting masterpiece">Óleo</option>
             <option value="watercolor painting">Acuarela</option>
             <option value="digital art">Arte Digital</option>
-            <option value="cinematic movie">Cinematográfico</option>
         </select>
     </div>
     
@@ -439,16 +481,10 @@ HTML_CONTENT = """
         let canvas = null;
         let ctx = null;
         
-        // Estadísticas avanzadas
         let frameCount = 0;
         let totalFrames = 0;
         let lastTime = Date.now();
         let latencies = [];
-        let fpsHistory = [];
-        
-        // Smoothing temporal
-        let lastImageData = null;
-        const smoothingFactor = 0.7;
         
         async function start() {
             try {
@@ -458,27 +494,24 @@ HTML_CONTENT = """
                 canvas.width = 512;
                 canvas.height = 512;
                 
-                // Obtener cámara con configuración optimizada
                 const stream = await navigator.mediaDevices.getUserMedia({
                     video: {
-                        width: { ideal: 1280, max: 1920 },
-                        height: { ideal: 720, max: 1080 },
-                        frameRate: { ideal: 30, max: 60 }
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 },
+                        frameRate: { ideal: 30 }
                     }
                 });
                 video.srcObject = stream;
                 
-                // Esperar que el video esté listo
                 await new Promise(resolve => {
                     video.onloadedmetadata = resolve;
                 });
                 
-                // Conectar WebSocket
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                 ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
                 
                 ws.onopen = () => {
-                    console.log('🚀 Conectado al servidor ultra-rápido');
+                    console.log('🚀 Conectado al servidor');
                     streaming = true;
                     document.getElementById('startBtn').disabled = true;
                     document.getElementById('stopBtn').disabled = false;
@@ -489,8 +522,13 @@ HTML_CONTENT = """
                 ws.onmessage = (event) => {
                     const data = JSON.parse(event.data);
                     if (data.image) {
-                        displayResult(data);
-                        updateAdvancedStats(data);
+                        const img = new Image();
+                        img.onload = () => {
+                            ctx.clearRect(0, 0, 512, 512);
+                            ctx.drawImage(img, 0, 0, 512, 512);
+                        };
+                        img.src = data.image;
+                        updateStats(data);
                     }
                 };
                 
@@ -500,7 +538,7 @@ HTML_CONTENT = """
                 };
                 
                 ws.onclose = () => {
-                    console.log('🔌 Desconectado del servidor');
+                    console.log('🔌 Desconectado');
                     stop();
                 };
                 
@@ -518,13 +556,11 @@ HTML_CONTENT = """
                 return;
             }
             
-            // Capturar frame optimizado
             const tempCanvas = document.createElement('canvas');
             tempCanvas.width = 512;
             tempCanvas.height = 512;
             const tempCtx = tempCanvas.getContext('2d');
             
-            // Centrar y recortar video
             const videoAspect = video.videoWidth / video.videoHeight;
             let sx, sy, sw, sh;
             
@@ -542,11 +578,9 @@ HTML_CONTENT = """
             
             tempCtx.drawImage(video, sx, sy, sw, sh, 0, 0, 512, 512);
             
-            // Preparar prompt optimizado para SD-Turbo
             const style = document.getElementById('style').value;
             let prompt = style ? `${style}, high quality, detailed` : "high quality, detailed, photorealistic";
             
-            // Enviar frame
             const imageData = tempCanvas.toDataURL('image/jpeg', 0.9);
             ws.send(JSON.stringify({
                 image: imageData,
@@ -554,20 +588,10 @@ HTML_CONTENT = """
                 timestamp: Date.now()
             }));
             
-            // Próximo frame inmediatamente (máxima velocidad)
             requestAnimationFrame(sendFrame);
         }
         
-        function displayResult(data) {
-            const img = new Image();
-            img.onload = () => {
-                ctx.clearRect(0, 0, 512, 512);
-                ctx.drawImage(img, 0, 0, 512, 512);
-            };
-            img.src = data.image;
-        }
-        
-        function updateAdvancedStats(data) {
+        function updateStats(data) {
             frameCount++;
             totalFrames++;
             
@@ -576,33 +600,20 @@ HTML_CONTENT = """
                 if (latencies.length > 50) latencies.shift();
             }
             
-            // Actualizar stats cada segundo
             const now = Date.now();
             if (now - lastTime >= 1000) {
-                const currentFps = frameCount;
-                fpsHistory.push(currentFps);
-                if (fpsHistory.length > 10) fpsHistory.shift();
-                
-                document.getElementById('fps').textContent = currentFps;
+                document.getElementById('fps').textContent = frameCount;
                 frameCount = 0;
                 lastTime = now;
                 
-                // Latencia promedio
                 if (latencies.length > 0) {
                     const avgLatency = latencies.reduce((a, b) => a + b) / latencies.length;
                     document.getElementById('latency').textContent = Math.round(avgLatency);
                 }
-                
-                // Eficiencia GPU (estimada)
-                const avgFps = fpsHistory.reduce((a, b) => a + b, 0) / fpsHistory.length;
-                const efficiency = Math.min(100, (avgFps / 20) * 100); // 20 FPS = 100%
-                document.getElementById('efficiency').textContent = Math.round(efficiency);
             }
             
-            // Stats del servidor
             if (data.stats) {
                 document.getElementById('totalFrames').textContent = data.stats.total_frames;
-                document.getElementById('skippedFrames').textContent = data.stats.skipped_frames;
                 document.getElementById('skipRate').textContent = data.stats.skip_rate.toFixed(1);
             }
         }
@@ -642,40 +653,33 @@ async def get():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("🚀 Cliente conectado - Modo ULTRA FAST")
+    print("🚀 Cliente conectado - SD-Turbo estable")
     
     try:
         while True:
-            # Recibir frame del cliente
             data = await websocket.receive_json()
             
             if 'image' not in data:
                 continue
             
-            # Decodificar imagen
             try:
                 img_data = base64.b64decode(data['image'].split(',')[1])
                 input_image = Image.open(io.BytesIO(img_data)).convert("RGB")
-                
-                # Redimensionar a 512x512 para SD-Turbo
                 input_image = input_image.resize((512, 512), Image.Resampling.LANCZOS)
                 
             except Exception as e:
                 print(f"❌ Error decodificando imagen: {e}")
                 continue
             
-            # Agregar a cola de procesamiento (non-blocking)
             processor.add_frame(
                 input_image, 
                 data.get('prompt', 'high quality, detailed'),
                 data.get('timestamp', time.time() * 1000)
             )
             
-            # Obtener resultado más reciente (si hay)
             result = processor.get_latest_result()
             
             if result:
-                # Codificar y enviar resultado
                 buffered = io.BytesIO()
                 result['image'].save(buffered, format="JPEG", quality=90)
                 img_str = base64.b64encode(buffered.getvalue()).decode()
@@ -696,12 +700,11 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*70)
-    print("🚀 ULTRA FAST SD-TURBO STREAM SERVER")
+    print("🚀 SD-TURBO STREAM SERVER (VERSIÓN ESTABLE)")
     print("="*70)
     print("⚡ SD-Turbo con 1 paso de inferencia")
+    print("🛡️ Manejo robusto de compatibilidad")
     print("🎯 Similarity filter activo")
-    print("🔄 Stream processing optimizado")
-    print("💾 Temporal smoothing habilitado")
     print("🌐 URL: http://0.0.0.0:8000")
     print("="*70 + "\n")
     
