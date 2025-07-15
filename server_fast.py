@@ -42,15 +42,17 @@ class VideoStreamProcessor:
             safety_checker=None
         ).to("cuda")
         
-        # Optimizaciones críticas
+        # Optimizaciones SIN cpu_offload ni torch.compile
         self.pipe.enable_xformers_memory_efficient_attention()
-        self.pipe.enable_model_cpu_offload()
         self.pipe.vae.enable_slicing()
         self.pipe.vae.enable_tiling()
         
-        # Compilar con torch.compile para máxima velocidad
-        self.pipe.unet = torch.compile(self.pipe.unet, mode="reduce-overhead", fullgraph=True)
-        self.pipe.vae = torch.compile(self.pipe.vae, mode="reduce-overhead", fullgraph=True)
+        # Configurar scheduler para SD-Turbo
+        self.pipe.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
+        
+        # Deshabilitar torch._dynamo para evitar errores
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True
         
         print("Modelo optimizado listo!")
         
@@ -77,19 +79,23 @@ class VideoStreamProcessor:
                         ).images[0]
                 
                 # Agregar a cola de salida
-                self.output_queue.put(result)
+                self.output_queue.put({
+                    'image': result,
+                    'timestamp': frame_data.get('timestamp', time.time())
+                })
                 
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Error en procesamiento: {e}")
     
-    def add_frame(self, image, prompt):
+    def add_frame(self, image, prompt, timestamp=None):
         """Agregar frame para procesar (no bloqueante)"""
         try:
             self.processing_queue.put_nowait({
                 'image': image,
-                'prompt': prompt
+                'prompt': prompt,
+                'timestamp': timestamp or time.time()
             })
         except queue.Full:
             # Si la cola está llena, descartar frames antiguos
@@ -97,7 +103,8 @@ class VideoStreamProcessor:
                 self.processing_queue.get_nowait()
                 self.processing_queue.put_nowait({
                     'image': image,
-                    'prompt': prompt
+                    'prompt': prompt,
+                    'timestamp': timestamp or time.time()
                 })
             except:
                 pass
@@ -129,6 +136,7 @@ async def websocket_endpoint(websocket: WebSocket):
     # Variables para FPS
     last_frame_time = time.time()
     frame_count = 0
+    fps_list = deque(maxlen=30)  # Para promedio móvil
     
     try:
         while True:
@@ -143,44 +151,66 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Redimensionar para velocidad
                 image = image.resize((512, 512), Image.Resampling.LANCZOS)
                 
-                # Agregar a procesamiento
-                processor.add_frame(image, data.get('prompt', 'cyberpunk style'))
+                # Construir prompt completo
+                style = data.get('prompt', 'cyberpunk')
+                full_prompt = f"{style} style, high quality, detailed, sharp focus"
+                
+                # Agregar a procesamiento con timestamp
+                timestamp = data.get('timestamp', time.time())
+                processor.add_frame(image, full_prompt, timestamp)
                 
                 # Obtener último frame procesado (si hay)
-                processed = processor.get_latest_frame()
+                processed_data = processor.get_latest_frame()
                 
-                if processed:
+                if processed_data:
+                    processed = processed_data['image']
+                    original_timestamp = processed_data['timestamp']
+                    
                     # Codificar y enviar
                     buffered = io.BytesIO()
-                    processed.save(buffered, format="JPEG", quality=80)
+                    processed.save(buffered, format="JPEG", quality=85)
                     img_str = base64.b64encode(buffered.getvalue()).decode()
                     
                     await websocket.send_json({
                         'type': 'frame',
-                        'image': f'data:image/jpeg;base64,{img_str}'
+                        'image': f'data:image/jpeg;base64,{img_str}',
+                        'timestamp': original_timestamp
                     })
                     
                     # Calcular FPS
                     frame_count += 1
                     current_time = time.time()
-                    if current_time - last_frame_time >= 1.0:
-                        fps = frame_count / (current_time - last_frame_time)
-                        print(f"FPS: {fps:.1f}")
+                    elapsed = current_time - last_frame_time
+                    
+                    if elapsed >= 0.1:  # Actualizar cada 100ms
+                        fps = frame_count / elapsed
+                        fps_list.append(fps)
+                        avg_fps = sum(fps_list) / len(fps_list)
+                        print(f"FPS: {fps:.1f} (avg: {avg_fps:.1f})")
                         frame_count = 0
                         last_frame_time = current_time
                 else:
                     # Si no hay frame procesado, reenviar el original
-                    # para mantener fluidez
+                    # para mantener fluidez visual
                     await websocket.send_json({
                         'type': 'frame',
-                        'image': data['image']
+                        'image': data['image'],
+                        'timestamp': data.get('timestamp', time.time())
                     })
             
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error en websocket: {e}")
     finally:
         print("Cliente desconectado")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    # Configuración optimizada para producción
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        log_level="info",
+        access_log=False,  # Desactivar logs de acceso para mejor rendimiento
+        loop="uvloop"  # Loop más rápido si está disponible
+    )
