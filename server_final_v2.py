@@ -449,7 +449,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 print(f"❌ Error decodificando imagen: {e}")
                 continue
 
-            strength       = float(data.get("strength",1.0))
+            strength = min(max(float(data.get("strength", 1.0)), 0.0), 0.99)
             guidance_scale = float(data.get("guidance_scale",0.0))
 
             processor.add_frame(
