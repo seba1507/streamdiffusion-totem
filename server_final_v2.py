@@ -45,14 +45,17 @@ class UltraFastDiffusion:
         self.device = torch.device("cuda:0")
         self.dtype = torch.float16
         
+        # Stream processing optimizations
         self.frame_queue = queue.Queue(maxsize=2)
         self.result_queue = queue.Queue(maxsize=3)
         self.processing = False
         
+        # Similarity filter
         self.last_image_hash = None
         self.similarity_threshold = 0.95
         self.frame_skip_counter = 0
         
+        # Performance metrics
         self.total_frames = 0
         self.skipped_frames = 0
         
@@ -72,20 +75,39 @@ class UltraFastDiffusion:
         )
         
         self.pipe = self.pipe.to(self.device)
+        
+        # Optimizaciones graduales con manejo de errores
         self.pipe.set_progress_bar_config(disable=True)
         
+        # Intentar XFormers primero
+        xformers_enabled = False
         try:
             self.pipe.enable_xformers_memory_efficient_attention()
+            xformers_enabled = True
             print("✓ XFormers habilitado")
         except Exception as e:
             print(f"⚠ XFormers no disponible: {e}")
+        
+        # Compilación de torch.compile - solo si XFormers no está habilitado
+        compile_enabled = False
+        if not xformers_enabled:
             try:
+                # Configurar torch._dynamo para manejar errores
                 torch._dynamo.config.suppress_errors = True
-                self.pipe.unet = torch.compile(self.pipe.unet, mode="reduce-overhead", fullgraph=False)
+                
+                self.pipe.unet = torch.compile(
+                    self.pipe.unet, 
+                    mode="reduce-overhead", 
+                    fullgraph=False  # Usar fullgraph=False para mejor compatibilidad
+                )
+                compile_enabled = True
                 print("✓ UNet compilado con torch.compile")
-            except Exception as e_compile:
-                print(f"⚠ torch.compile no disponible: {e_compile}")
-
+            except Exception as e:
+                print(f"⚠ torch.compile no disponible: {e}")
+        else:
+            print("⚠ torch.compile deshabilitado (conflicto con XFormers)")
+        
+        # VAE optimizations - estas son siempre seguras
         try:
             self.pipe.vae.enable_slicing()
             self.pipe.vae.enable_tiling()
@@ -93,70 +115,139 @@ class UltraFastDiffusion:
         except Exception as e:
             print(f"⚠ Optimizaciones VAE fallaron: {e}")
         
+        # Pre-calentar con configuración segura
         print("Pre-calentando pipeline...")
         dummy_image = Image.new('RGB', (512, 512), color='black')
         
         try:
-            with torch.no_grad(), torch.cuda.amp.autocast():
-                # <-- CORREGIDO: Usar 2 pasos para que 'strength' funcione correctamente.
-                _ = self.pipe("test", image=dummy_image, num_inference_steps=2, strength=0.5, guidance_scale=0.0, negative_prompt=None).images[0]
+            with torch.no_grad():
+                # No usar autocast si hay problemas de compatibilidad
+                if xformers_enabled or compile_enabled:
+                    with torch.cuda.amp.autocast():
+                        _ = self.pipe(
+                            "test",
+                            image=dummy_image,
+                            num_inference_steps=1,
+                            strength=0.2,
+                            guidance_scale=0.0
+                        ).images[0]
+                else:
+                    _ = self.pipe(
+                        "test",
+                        image=dummy_image,
+                        num_inference_steps=1,
+                        strength=0.2,
+                        guidance_scale=0.0
+                    ).images[0]
             print("✓ Pre-calentamiento exitoso")
         except Exception as e:
             print(f"⚠ Error en pre-calentamiento: {e}")
+            print("Continuando sin pre-calentamiento...")
         
         print("✓ Modelo listo!")
+        
+        # Performance summary
+        optimizations = []
+        if xformers_enabled:
+            optimizations.append("XFormers")
+        if compile_enabled:
+            optimizations.append("torch.compile")
+        optimizations.append("VAE optimizado")
+        
+        print(f"Optimizaciones activas: {', '.join(optimizations)}")
+        
+        # Iniciar thread de procesamiento
         self.start_processing_thread()
     
     def calculate_image_hash(self, image):
+        """Calcular hash rápido de imagen para similarity filter"""
         try:
             small_img = image.resize((64, 64))
             img_array = np.array(small_img)
             return hashlib.md5(img_array.tobytes()).hexdigest()
         except Exception:
-            return str(time.time())
+            return str(time.time())  # Fallback básico
     
     def should_skip_frame(self, image):
+        """Implementar similarity filter"""
         try:
             current_hash = self.calculate_image_hash(image)
-            if self.last_image_hash and current_hash == self.last_image_hash:
+            
+            if self.last_image_hash is None:
+                self.last_image_hash = current_hash
+                return False
+            
+            if current_hash == self.last_image_hash:
                 self.frame_skip_counter += 1
                 return True
+            
             self.last_image_hash = current_hash
             self.frame_skip_counter = 0
             return False
         except Exception:
-            return False
+            return False  # En caso de error, no saltar frame
     
     def start_processing_thread(self):
+        """Iniciar thread de procesamiento continuo"""
         self.processing = True
         processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
         processing_thread.start()
         print("✓ Thread de procesamiento iniciado")
     
     def _processing_loop(self):
+        """Loop principal de procesamiento en thread separado"""
         while self.processing:
             try:
                 frame_data = self.frame_queue.get(timeout=0.1)
                 
                 start_time = time.time()
                 
+                # Similarity filter
                 if self.should_skip_frame(frame_data['image']):
                     self.skipped_frames += 1
+                    try:
+                        last_result = self.result_queue.queue[-1] if self.result_queue.queue else None
+                        if last_result:
+                            self.result_queue.put_nowait(last_result)
+                    except:
+                        pass
                     continue
                 
+                # Generar con SD-Turbo - configuración ultra-conservadora
                 try:
-                    with torch.no_grad(), torch.cuda.amp.autocast():
-                        # <-- CORREGIDO: Usar 2 pasos aquí también para la consistencia y estabilidad.
-                        result = self.pipe(
-                            prompt=frame_data['prompt'],
-                            image=frame_data['image'],
-                            num_inference_steps=2,
-                            strength=frame_data['strength'],
-                            guidance_scale=frame_data['guidance_scale'],
-                            negative_prompt=None,
-                            generator=torch.Generator(device=self.device).manual_seed(42)
-                        ).images[0]
-
+                    with torch.no_grad():
+                        # Usar autocast solo si no hay conflictos
+                        use_autocast = True
+                        try:
+                            if use_autocast:
+                                with torch.cuda.amp.autocast():
+                                    result = self.pipe(
+                                        prompt=frame_data['prompt'],
+                                        image=frame_data['image'],
+                                        num_inference_steps=1,
+                                        strength=0.2,
+                                        guidance_scale=0.0,
+                                        generator=torch.Generator(device=self.device).manual_seed(42)
+                                    ).images[0]
+                            else:
+                                result = self.pipe(
+                                    prompt=frame_data['prompt'],
+                                    image=frame_data['image'],
+                                    num_inference_steps=1,
+                                    strength=0.2,
+                                    guidance_scale=0.0,
+                                    generator=torch.Generator(device=self.device).manual_seed(42)
+                                ).images[0]
+                        except Exception as autocast_error:
+                            print(f"Autocast falló, usando modo estándar: {autocast_error}")
+                            result = self.pipe(
+                                prompt=frame_data['prompt'],
+                                image=frame_data['image'],
+                                num_inference_steps=1,
+                                strength=0.2,
+                                guidance_scale=0.0
+                            ).images[0]
+                    
                     processing_time = (time.time() - start_time) * 1000
                     self.total_frames += 1
                     
@@ -177,24 +268,27 @@ class UltraFastDiffusion:
                         try:
                             self.result_queue.get_nowait()
                             self.result_queue.put_nowait(result_data)
-                        except queue.Empty:
+                        except:
                             pass
                             
+                    print(f"Frame procesado: {processing_time:.1f}ms (Skip rate: {self.skipped_frames}/{self.total_frames})")
+                    
                 except Exception as process_error:
                     print(f"Error procesando frame: {process_error}")
+                    continue
                 
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Error en processing loop: {e}")
-
-    def add_frame(self, image, prompt, timestamp, strength, guidance_scale):
+                continue
+    
+    def add_frame(self, image, prompt, timestamp):
+        """Agregar frame para procesamiento (non-blocking)"""
         frame_data = {
             'image': image,
             'prompt': prompt,
-            'timestamp': timestamp,
-            'strength': strength,
-            'guidance_scale': guidance_scale
+            'timestamp': timestamp
         }
         
         try:
@@ -203,10 +297,11 @@ class UltraFastDiffusion:
             try:
                 self.frame_queue.get_nowait()
                 self.frame_queue.put_nowait(frame_data)
-            except queue.Empty:
+            except:
                 pass
     
     def get_latest_result(self):
+        """Obtener resultado más reciente (non-blocking)"""
         result = None
         while not self.result_queue.empty():
             try:
@@ -215,33 +310,126 @@ class UltraFastDiffusion:
                 break
         return result
 
+# Instancia global
 processor = UltraFastDiffusion()
 
-# El HTML y el resto del código Python permanecen sin cambios.
+# HTML optimizado y simplificado
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html>
 <head>
     <title>Ultra Fast SD-Turbo Stream</title>
     <style>
-        body { margin: 0; background: #000; color: #fff; font-family: 'Consolas', monospace; overflow: hidden; }
-        .container { display: flex; height: 100vh; align-items: center; justify-content: center; gap: 20px; }
-        video, canvas { width: 512px; height: 512px; border: 2px solid #00ff41; background: #111; border-radius: 8px; }
-        .controls { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.9); padding: 15px; border-radius: 15px; display: flex; flex-direction: column; gap: 15px; border: 1px solid #00ff41; width: 600px; }
-        .controls-row { display: flex; gap: 15px; align-items: center; justify-content: space-between; }
-        .slider-group { display: flex; flex-direction: column; width: 100%; }
-        .slider-group label { margin-bottom: 5px; font-size: 14px; }
-        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: linear-gradient(45deg, #00ff41, #00cc33); color: #000; border: none; border-radius: 8px; font-weight: bold; transition: all 0.3s; }
-        button:hover { transform: scale(1.05); box-shadow: 0 0 20px #00ff41; }
-        button:disabled { background: #333; color: #666; cursor: not-allowed; transform: none; box-shadow: none; }
-        select, input[type=text] { padding: 10px; font-size: 14px; border-radius: 8px; background: #222; color: #fff; border: 1px solid #00ff41; }
-        input[type=range] { width: 100%; }
-        .stats { position: fixed; top: 20px; right: 20px; background: rgba(0,0,0,0.9); padding: 20px; border-radius: 15px; font-size: 14px; border: 1px solid #00ff41; min-width: 250px; }
-        .stat-value { color: #00ff41; font-weight: bold; font-size: 16px; }
-        .stat-row { display: flex; justify-content: space-between; margin: 8px 0; }
-        .status-indicator { position: absolute; top: 10px; left: 10px; width: 20px; height: 20px; border-radius: 50%; background: #ff4444; transition: all 0.3s; }
-        .status-indicator.active { background: #00ff41; box-shadow: 0 0 15px #00ff41; }
-        .title { text-align: center; margin-bottom: 10px; color: #00ff41; font-size: 18px; font-weight: bold; }
+        body {
+            margin: 0;
+            background: #000;
+            color: #fff;
+            font-family: 'Consolas', monospace;
+            overflow: hidden;
+        }
+        .container {
+            display: flex;
+            height: 100vh;
+            align-items: center;
+            justify-content: center;
+            gap: 20px;
+        }
+        video, canvas {
+            width: 512px;
+            height: 512px;
+            border: 2px solid #00ff41;
+            background: #111;
+            border-radius: 8px;
+        }
+        .output-container {
+            position: relative;
+        }
+        .controls {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.9);
+            padding: 20px;
+            border-radius: 15px;
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            border: 1px solid #00ff41;
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            cursor: pointer;
+            background: linear-gradient(45deg, #00ff41, #00cc33);
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+        button:hover {
+            transform: scale(1.05);
+            box-shadow: 0 0 20px #00ff41;
+        }
+        button:disabled {
+            background: #333;
+            color: #666;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        select {
+            padding: 12px;
+            font-size: 16px;
+            border-radius: 8px;
+            background: #222;
+            color: #fff;
+            border: 1px solid #00ff41;
+        }
+        .stats {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: rgba(0,0,0,0.9);
+            padding: 20px;
+            border-radius: 15px;
+            font-family: 'Consolas', monospace;
+            font-size: 14px;
+            border: 1px solid #00ff41;
+            min-width: 250px;
+        }
+        .stat-value {
+            color: #00ff41;
+            font-weight: bold;
+            font-size: 16px;
+        }
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            margin: 8px 0;
+        }
+        .status-indicator {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #ff4444;
+            transition: all 0.3s;
+        }
+        .status-indicator.active {
+            background: #00ff41;
+            box-shadow: 0 0 15px #00ff41;
+        }
+        .title {
+            text-align: center;
+            margin-bottom: 10px;
+            color: #00ff41;
+            font-size: 18px;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
@@ -255,65 +443,69 @@ HTML_CONTENT = """
     
     <div class="stats">
         <div class="title">SD-TURBO METRICS</div>
-        <div class="stat-row"><span>FPS:</span><span id="fps" class="stat-value">0</span></div>
-        <div class="stat-row"><span>Latencia:</span><span id="latency" class="stat-value">0</span>ms</div>
-        <div class="stat-row"><span>Total Frames:</span><span id="totalFrames" class="stat-value">0</span></div>
-        <div class="stat-row"><span>Skip Rate:</span><span id="skipRate" class="stat-value">0</span>%</div>
+        <div class="stat-row">
+            <span>FPS:</span>
+            <span id="fps" class="stat-value">0</span>
+        </div>
+        <div class="stat-row">
+            <span>Latencia:</span>
+            <span id="latency" class="stat-value">0</span>ms
+        </div>
+        <div class="stat-row">
+            <span>Total Frames:</span>
+            <span id="totalFrames" class="stat-value">0</span>
+        </div>
+        <div class="stat-row">
+            <span>Skip Rate:</span>
+            <span id="skipRate" class="stat-value">0</span>%
+        </div>
     </div>
     
     <div class="controls">
-        <div class="controls-row">
-            <button id="startBtn" onclick="start()">🚀 INICIAR TURBO</button>
-            <button id="stopBtn" onclick="stop()" disabled>⏹ DETENER</button>
-            <select id="styleSelect">
-                <option value="">Fotorealista</option>
-                <option value="cyberpunk futuristic">Cyberpunk</option>
-                <option value="anime style">Anime</option>
-                <option value="oil painting masterpiece">Óleo</option>
-                <option value="watercolor painting">Acuarela</option>
-                <option value="digital art">Arte Digital</option>
-            </select>
-            <input type="text" id="promptInput" placeholder="Añade tu prompt personalizado aquí...">
-        </div>
-        <div class="controls-row">
-            <div class="slider-group">
-                <label for="strengthSlider">Strength: <span id="strengthValue">0.50</span></label>
-                <input type="range" id="strengthSlider" min="0.1" max="1.0" step="0.05" value="0.5">
-            </div>
-            <div class="slider-group">
-                <label for="guidanceSlider">Guidance (Mantener en 0.0): <span id="guidanceValue">0.0</span></label>
-                <input type="range" id="guidanceSlider" min="0.0" max="2.0" step="0.1" value="0.0">
-            </div>
-        </div>
+        <button id="startBtn" onclick="start()">🚀 INICIAR TURBO</button>
+        <button id="stopBtn" onclick="stop()" disabled>⏹ DETENER</button>
+        <select id="style">
+            <option value="">Fotorealista</option>
+            <option value="cyberpunk futuristic">Cyberpunk</option>
+            <option value="anime style">Anime</option>
+            <option value="oil painting masterpiece">Óleo</option>
+            <option value="watercolor painting">Acuarela</option>
+            <option value="digital art">Arte Digital</option>
+        </select>
     </div>
     
     <script>
         let ws = null;
         let streaming = false;
-        let video = document.getElementById('video');
-        let canvas = document.getElementById('output');
-        let ctx = canvas.getContext('2d');
+        let video = null;
+        let canvas = null;
+        let ctx = null;
         
         let frameCount = 0;
+        let totalFrames = 0;
         let lastTime = Date.now();
         let latencies = [];
-
-        const strengthSlider = document.getElementById('strengthSlider');
-        const guidanceSlider = document.getElementById('guidanceSlider');
-        const strengthValue = document.getElementById('strengthValue');
-        const guidanceValue = document.getElementById('guidanceValue');
-
-        strengthSlider.addEventListener('input', () => strengthValue.textContent = parseFloat(strengthSlider.value).toFixed(2));
-        guidanceSlider.addEventListener('input', () => guidanceValue.textContent = parseFloat(guidanceSlider.value).toFixed(1));
-
+        
         async function start() {
             try {
+                video = document.getElementById('video');
+                canvas = document.getElementById('output');
+                ctx = canvas.getContext('2d');
                 canvas.width = 512;
                 canvas.height = 512;
                 
-                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } } });
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 },
+                        frameRate: { ideal: 30 }
+                    }
+                });
                 video.srcObject = stream;
-                await new Promise(resolve => { video.onloadedmetadata = resolve; });
+                
+                await new Promise(resolve => {
+                    video.onloadedmetadata = resolve;
+                });
                 
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                 ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
@@ -340,8 +532,15 @@ HTML_CONTENT = """
                     }
                 };
                 
-                ws.onerror = (error) => { console.error('❌ Error WebSocket:', error); stop(); };
-                ws.onclose = () => { console.log('🔌 Desconectado'); stop(); };
+                ws.onerror = (error) => {
+                    console.error('❌ Error WebSocket:', error);
+                    stop();
+                };
+                
+                ws.onclose = () => {
+                    console.log('🔌 Desconectado');
+                    stop();
+                };
                 
             } catch (error) {
                 console.error('❌ Error:', error);
@@ -351,7 +550,11 @@ HTML_CONTENT = """
         
         function sendFrame() {
             if (!streaming || !ws || ws.readyState !== WebSocket.OPEN) return;
-            if (video.videoWidth === 0) { requestAnimationFrame(sendFrame); return; }
+            
+            if (video.videoWidth === 0 || video.videoHeight === 0) {
+                setTimeout(sendFrame, 10);
+                return;
+            }
             
             const tempCanvas = document.createElement('canvas');
             tempCanvas.width = 512;
@@ -359,30 +562,29 @@ HTML_CONTENT = """
             const tempCtx = tempCanvas.getContext('2d');
             
             const videoAspect = video.videoWidth / video.videoHeight;
-            const sx = videoAspect > 1 ? (video.videoWidth - video.videoHeight) / 2 : 0;
-            const sy = videoAspect > 1 ? 0 : (video.videoHeight - video.videoWidth) / 2;
-            const sWidth = videoAspect > 1 ? video.videoHeight : video.videoWidth;
-            const sHeight = sWidth;
+            let sx, sy, sw, sh;
             
-            tempCtx.drawImage(video, sx, sy, sWidth, sHeight, 0, 0, 512, 512);
-            
-            const style = document.getElementById('styleSelect').value;
-            const customPrompt = document.getElementById('promptInput').value;
-            let finalPrompt = style ? `${style}` : "photorealistic";
-            if (customPrompt) {
-                finalPrompt = `${finalPrompt}, ${customPrompt}`;
+            if (videoAspect > 1) {
+                sw = video.videoHeight;
+                sh = video.videoHeight;
+                sx = (video.videoWidth - sw) / 2;
+                sy = 0;
+            } else {
+                sw = video.videoWidth;
+                sh = video.videoWidth;
+                sx = 0;
+                sy = (video.videoHeight - sh) / 2;
             }
-            finalPrompt += ", high quality, detailed";
-
-            const strength = parseFloat(strengthSlider.value);
-            const guidance_scale = parseFloat(guidanceSlider.value);
+            
+            tempCtx.drawImage(video, sx, sy, sw, sh, 0, 0, 512, 512);
+            
+            const style = document.getElementById('style').value;
+            let prompt = style ? `${style}, high quality, detailed` : "high quality, detailed, photorealistic";
             
             const imageData = tempCanvas.toDataURL('image/jpeg', 0.9);
             ws.send(JSON.stringify({
                 image: imageData,
-                prompt: finalPrompt,
-                strength: strength,
-                guidance_scale: guidance_scale,
+                prompt: prompt,
                 timestamp: Date.now()
             }));
             
@@ -391,6 +593,8 @@ HTML_CONTENT = """
         
         function updateStats(data) {
             frameCount++;
+            totalFrames++;
+            
             if (data.processing_time) {
                 latencies.push(data.processing_time);
                 if (latencies.length > 50) latencies.shift();
@@ -401,6 +605,7 @@ HTML_CONTENT = """
                 document.getElementById('fps').textContent = frameCount;
                 frameCount = 0;
                 lastTime = now;
+                
                 if (latencies.length > 0) {
                     const avgLatency = latencies.reduce((a, b) => a + b) / latencies.length;
                     document.getElementById('latency').textContent = Math.round(avgLatency);
@@ -415,9 +620,21 @@ HTML_CONTENT = """
         
         function stop() {
             streaming = false;
-            if (ws) ws.close();
-            if (video && video.srcObject) video.srcObject.getTracks().forEach(track => track.stop());
-            if (ctx) ctx.clearRect(0, 0, 512, 512);
+            
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            
+            if (video && video.srcObject) {
+                video.srcObject.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
+            }
+            
+            if (ctx) {
+                ctx.clearRect(0, 0, 512, 512);
+            }
+            
             document.getElementById('startBtn').disabled = false;
             document.getElementById('stopBtn').disabled = true;
             document.getElementById('statusIndicator').classList.remove('active');
@@ -442,24 +659,22 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             data = await websocket.receive_json()
             
-            if 'image' not in data: continue
+            if 'image' not in data:
+                continue
             
             try:
                 img_data = base64.b64decode(data['image'].split(',')[1])
-                input_image = Image.open(io.BytesIO(img_data)).convert("RGB").resize((512, 512), Image.Resampling.LANCZOS)
+                input_image = Image.open(io.BytesIO(img_data)).convert("RGB")
+                input_image = input_image.resize((512, 512), Image.Resampling.LANCZOS)
+                
             except Exception as e:
                 print(f"❌ Error decodificando imagen: {e}")
                 continue
             
-            strength = float(data.get('strength', 0.5))
-            guidance_scale = float(data.get('guidance_scale', 0.0))
-
             processor.add_frame(
                 input_image, 
                 data.get('prompt', 'high quality, detailed'),
-                data.get('timestamp', time.time() * 1000),
-                strength,
-                guidance_scale
+                data.get('timestamp', time.time() * 1000)
             )
             
             result = processor.get_latest_result()
@@ -485,10 +700,11 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*70)
-    print("🚀 SD-TURBO STREAM SERVER (VERSIÓN FINAL ESTABLE)")
+    print("🚀 SD-TURBO STREAM SERVER (VERSIÓN ESTABLE)")
     print("="*70)
-    print("⚡ Usando 2 pasos de inferencia para un control de 'strength' robusto.")
-    print("🎮 Controles de Strength, Guidance y Prompt en tiempo real")
+    print("⚡ SD-Turbo con 1 paso de inferencia")
+    print("🛡️ Manejo robusto de compatibilidad")
+    print("🎯 Similarity filter activo")
     print("🌐 URL: http://0.0.0.0:8000")
     print("="*70 + "\n")
     
