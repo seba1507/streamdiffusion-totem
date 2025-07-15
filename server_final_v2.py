@@ -98,7 +98,8 @@ class UltraFastDiffusion:
         
         try:
             with torch.no_grad(), torch.cuda.amp.autocast():
-                _ = self.pipe("test", image=dummy_image, num_inference_steps=1, strength=0.5, guidance_scale=0.0).images[0]
+                # <-- CORREGIDO: Añadir negative_prompt=None para evitar el error de TensorList
+                _ = self.pipe("test", image=dummy_image, num_inference_steps=1, strength=0.5, guidance_scale=0.0, negative_prompt=None).images[0]
             print("✓ Pre-calentamiento exitoso")
         except Exception as e:
             print(f"⚠ Error en pre-calentamiento: {e}")
@@ -145,13 +146,14 @@ class UltraFastDiffusion:
                 
                 try:
                     with torch.no_grad(), torch.cuda.amp.autocast():
-                        # <-- MODIFICADO: Usar los valores del frame_data
+                        # <-- CORREGIDO: Añadir negative_prompt=None aquí también
                         result = self.pipe(
                             prompt=frame_data['prompt'],
                             image=frame_data['image'],
                             num_inference_steps=1,
                             strength=frame_data['strength'],
                             guidance_scale=frame_data['guidance_scale'],
+                            negative_prompt=None,
                             generator=torch.Generator(device=self.device).manual_seed(42)
                         ).images[0]
 
@@ -186,7 +188,6 @@ class UltraFastDiffusion:
             except Exception as e:
                 print(f"Error en processing loop: {e}")
 
-    # <-- MODIFICADO: La función ahora acepta strength y guidance_scale
     def add_frame(self, image, prompt, timestamp, strength, guidance_scale):
         frame_data = {
             'image': image,
@@ -216,7 +217,6 @@ class UltraFastDiffusion:
 
 processor = UltraFastDiffusion()
 
-# <-- MODIFICADO: Actualizado el HTML y el JavaScript
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html>
@@ -280,7 +280,7 @@ HTML_CONTENT = """
                 <input type="range" id="strengthSlider" min="0.1" max="1.0" step="0.05" value="0.5">
             </div>
             <div class="slider-group">
-                <label for="guidanceSlider">Guidance: <span id="guidanceValue">0.0</span></label>
+                <label for="guidanceSlider">Guidance (Mantener en 0.0): <span id="guidanceValue">0.0</span></label>
                 <input type="range" id="guidanceSlider" min="0.0" max="2.0" step="0.1" value="0.0">
             </div>
         </div>
@@ -297,13 +297,11 @@ HTML_CONTENT = """
         let lastTime = Date.now();
         let latencies = [];
 
-        // <-- NUEVO: Referencias a los nuevos controles
         const strengthSlider = document.getElementById('strengthSlider');
         const guidanceSlider = document.getElementById('guidanceSlider');
         const strengthValue = document.getElementById('strengthValue');
         const guidanceValue = document.getElementById('guidanceValue');
 
-        // <-- NUEVO: Actualizar el texto del valor cuando el slider cambia
         strengthSlider.addEventListener('input', () => strengthValue.textContent = parseFloat(strengthSlider.value).toFixed(2));
         guidanceSlider.addEventListener('input', () => guidanceValue.textContent = parseFloat(guidanceSlider.value).toFixed(1));
 
@@ -367,7 +365,6 @@ HTML_CONTENT = """
             
             tempCtx.drawImage(video, sx, sy, sWidth, sHeight, 0, 0, 512, 512);
             
-            // <-- MODIFICADO: Construir el prompt y obtener los nuevos valores
             const style = document.getElementById('styleSelect').value;
             const customPrompt = document.getElementById('promptInput').value;
             let finalPrompt = style ? `${style}` : "photorealistic";
@@ -379,7 +376,6 @@ HTML_CONTENT = """
             const strength = parseFloat(strengthSlider.value);
             const guidance_scale = parseFloat(guidanceSlider.value);
             
-            // <-- MODIFICADO: Enviar los nuevos valores en el JSON
             const imageData = tempCanvas.toDataURL('image/jpeg', 0.9);
             ws.send(JSON.stringify({
                 image: imageData,
@@ -454,11 +450,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 print(f"❌ Error decodificando imagen: {e}")
                 continue
             
-            # <-- MODIFICADO: Obtener strength y guidance_scale del JSON recibido
             strength = float(data.get('strength', 0.5))
             guidance_scale = float(data.get('guidance_scale', 0.0))
 
-            # <-- MODIFICADO: Pasar los nuevos valores al procesador
             processor.add_frame(
                 input_image, 
                 data.get('prompt', 'high quality, detailed'),
@@ -490,10 +484,11 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*70)
-    print("🚀 SD-TURBO STREAM SERVER (VERSIÓN INTERACTIVA)")
+    print("🚀 SD-TURBO STREAM SERVER (VERSIÓN INTERACTIVA Y ESTABLE)")
     print("="*70)
     print("⚡ SD-Turbo con 1 paso de inferencia")
     print("🎮 Controles de Strength, Guidance y Prompt en tiempo real")
+    print("🔧 Corregido el error 'stack expects a non-empty TensorList'")
     print("🌐 URL: http://0.0.0.0:8000")
     print("="*70 + "\n")
     
