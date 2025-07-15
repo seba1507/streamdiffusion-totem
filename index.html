@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Style Transfer - Totem</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body { 
+            background: #0a0a0a; 
+            color: white; 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            overflow: hidden;
+            height: 100vh;
+        }
+        
+        .main-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            gap: 60px;
+        }
+        
+        .video-container {
+            text-align: center;
+            position: relative;
+        }
+        
+        .video-frame {
+            width: 500px;
+            height: 500px;
+            background: #111;
+            border-radius: 30px;
+            overflow: hidden;
+            box-shadow: 0 0 50px rgba(0, 255, 255, 0.2);
+            position: relative;
+        }
+        
+        video, .output-image {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        
+        .output-image {
+            display: block;
+        }
+        
+        h2 {
+            font-size: 32px;
+            margin-bottom: 20px;
+            text-transform: uppercase;
+            letter-spacing: 3px;
+            background: linear-gradient(45deg, #00ff88, #00ccff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .controls {
+            position: fixed;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.95);
+            padding: 30px 50px;
+            border-radius: 20px;
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+        
+        button {
+            padding: 15px 35px;
+            background: linear-gradient(135deg, #00ff88, #00ccff);
+            color: black;
+            border: none;
+            border-radius: 12px;
+            font-size: 18px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(0, 255, 200, 0.4);
+        }
+        
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        select {
+            padding: 15px 25px;
+            background: #1a1a1a;
+            color: white;
+            border: 2px solid #333;
+            border-radius: 12px;
+            font-size: 16px;
+            cursor: pointer;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+        
+        select:focus {
+            border-color: #00ccff;
+        }
+        
+        .status {
+            position: fixed;
+            top: 40px;
+            right: 40px;
+            padding: 15px 30px;
+            background: rgba(0, 0, 0, 0.9);
+            border-radius: 30px;
+            font-weight: bold;
+            font-size: 18px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status.connected {
+            border: 2px solid #00ff88;
+            color: #00ff88;
+        }
+        
+        .status.disconnected {
+            border: 2px solid #ff4444;
+            color: #ff4444;
+        }
+        
+        .loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.3s;
+        }
+        
+        .loading-overlay.active {
+            opacity: 1;
+            visibility: visible;
+        }
+        
+        .spinner {
+            width: 60px;
+            height: 60px;
+            border: 4px solid rgba(0, 255, 255, 0.3);
+            border-top-color: #00ffff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .fps-control {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 10px 20px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+        }
+        
+        .fps-control label {
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            opacity: 0.8;
+        }
+        
+        input[type="range"] {
+            width: 100px;
+            height: 6px;
+            background: #333;
+            border-radius: 3px;
+            outline: none;
+            -webkit-appearance: none;
+        }
+        
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            background: #00ccff;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+        
+        .fps-value {
+            font-weight: bold;
+            color: #00ccff;
+            min-width: 20px;
+        }
+        
+        /* Efecto de brillo para el totem */
+        @keyframes glow {
+            0%, 100% { box-shadow: 0 0 50px rgba(0, 255, 255, 0.2); }
+            50% { box-shadow: 0 0 80px rgba(0, 255, 255, 0.4); }
+        }
+        
+        .video-frame {
+            animation: glow 4s ease-in-out infinite;
+        }
+        
+        /* Modo Totem - pantalla completa */
+        .totem-mode {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: black;
+            z-index: 1000;
+        }
+        
+        .totem-mode .main-container {
+            gap: 0;
+        }
+        
+        .totem-mode .video-container:first-child {
+            display: none;
+        }
+        
+        .totem-mode .video-frame {
+            width: 90vw;
+            height: 90vh;
+            max-width: 1000px;
+            max-height: 1000px;
+        }
+        
+        .totem-mode .controls {
+            opacity: 0;
+            pointer-events: none;
+        }
+        
+        .totem-mode .status {
+            opacity: 0;
+        }
+        
+        .totem-toggle {
+            position: fixed;
+            top: 40px;
+            left: 40px;
+            padding: 10px 20px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .totem-toggle:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+    </style>
+</head>
+<body>
+    <div id="status" class="status disconnected">
+        <span class="status-icon">●</span>
+        <span>Desconectado</span>
+    </div>
+    
+    <button class="totem-toggle" onclick="toggleTotemMode()">🖥️ Modo Totem</button>
+    
+    <div class="main-container">
+        <div class="video-container">
+            <h2>📷 Original</h2>
+            <div class="video-frame">
+                <video id="video" autoplay playsinline muted></video>
+            </div>
+        </div>
+        
+        <div class="video-container">
+            <h2>🎨 AI Style</h2>
+            <div class="video-frame">
+                <img id="output" class="output-image" />
+                <div class="loading-overlay" id="loading">
+                    <div class="spinner"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="controls">
+        <button onclick="start()" id="startBtn">▶️ Iniciar</button>
+        <button onclick="stop()" id="stopBtn" disabled>⏹️ Detener</button>
+        
+        <select id="style">
+            <option value="cyberpunk style, neon lights, futuristic">🌃 Cyberpunk</option>
+            <option value="anime style, vibrant colors, cel shaded">🎌 Anime</option>
+            <option value="oil painting, artistic masterpiece, colorful">🎨 Óleo</option>
+            <option value="watercolor painting, soft colors, artistic">🖼️ Acuarela</option>
+            <option value="3d pixar style, colorful, animated">🎬 Pixar 3D</option>
+            <option value="comic book style, bold lines, pop art">💥 Comic</option>
+            <option value="holographic, iridescent, futuristic">✨ Holográfico</option>
+            <option value="vaporwave aesthetic, neon, retro">🌴 Vaporwave</option>
+        </select>
+        
+        <div class="fps-control">
+            <label>FPS:</label>
+            <input type="range" id="fps" min="1" max="10" value="3">
+            <span class="fps-value" id="fpsValue">3</span>
+        </div>
+    </div>
+    
+    <script>
+        let ws = null;
+        let isProcessing = false;
+        let sendInterval = null;
+        let isTotemMode = false;
+        
+        // Actualizar valor de FPS
+        document.getElementById('fps').addEventListener('input', (e) => {
+            document.getElementById('fpsValue').textContent = e.target.value;
+            if (sendInterval) {
+                clearInterval(sendInterval);
+                startSending();
+            }
+        });
+        
+        function updateStatus(connected) {
+            const status = document.getElementById('status');
+            if (connected) {
+                status.className = 'status connected';
+                status.innerHTML = '<span class="status-icon">●</span><span>Conectado</span>';
+            } else {
+                status.className = 'status disconnected';
+                status.innerHTML = '<span class="status-icon">●</span><span>Desconectado</span>';
+            }
+        }
+        
+        async function start() {
+            try {
+                // Solicitar permisos de cámara
+                const video = document.getElementById('video');
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { 
+                        width: { ideal: 1920 },
+                        height: { ideal: 1080 },
+                        facingMode: 'user'
+                    }
+                });
+                video.srcObject = stream;
+                
+                // Conectar WebSocket
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+                
+                ws.onopen = () => {
+                    console.log('Conectado al servidor');
+                    updateStatus(true);
+                    document.getElementById('startBtn').disabled = true;
+                    document.getElementById('stopBtn').disabled = false;
+                    startSending();
+                };
+                
+                ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    document.getElementById('output').src = data.image;
+                    document.getElementById('loading').classList.remove('active');
+                    isProcessing = false;
+                };
+                
+                ws.onclose = () => {
+                    console.log('Desconectado del servidor');
+                    updateStatus(false);
+                    stop();
+                };
+                
+                ws.onerror = (error) => {
+                    console.error('Error en WebSocket:', error);
+                    alert('Error conectando al servidor');
+                };
+                
+            } catch (err) {
+                console.error('Error:', err);
+                alert('Error al acceder a la cámara: ' + err.message);
+            }
+        }
+        
+        function startSending() {
+            const video = document.getElementById('video');
+            const canvas = document.createElement('canvas');
+            canvas.width = canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+            
+            const fps = parseInt(document.getElementById('fps').value);
+            const delay = 1000 / fps;
+            
+            sendInterval = setInterval(() => {
+                if (ws && ws.readyState === WebSocket.OPEN && !isProcessing) {
+                    // Calcular crop cuadrado centrado
+                    const videoAspect = video.videoWidth / video.videoHeight;
+                    let sx, sy, sw, sh;
+                    
+                    if (videoAspect > 1) {
+                        // Video más ancho
+                        sw = sh = video.videoHeight;
+                        sx = (video.videoWidth - sw) / 2;
+                        sy = 0;
+                    } else {
+                        // Video más alto
+                        sw = sh = video.videoWidth;
+                        sx = 0;
+                        sy = (video.videoHeight - sh) / 2;
+                    }
+                    
+                    // Dibujar frame
+                    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, 512, 512);
+                    
+                    // Enviar al servidor
+                    const imageData = canvas.toDataURL('image/jpeg', 0.85);
+                    ws.send(JSON.stringify({
+                        image: imageData,
+                        style: document.getElementById('style').value
+                    }));
+                    
+                    isProcessing = true;
+                    document.getElementById('loading').classList.add('active');
+                }
+            }, delay);
+        }
+        
+        function stop() {
+            // Limpiar interval
+            if (sendInterval) {
+                clearInterval(sendInterval);
+                sendInterval = null;
+            }
+            
+            // Cerrar WebSocket
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            
+            // Detener cámara
+            const video = document.getElementById('video');
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
+            }
+            
+            // Actualizar UI
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            document.getElementById('output').src = '';
+            document.getElementById('loading').classList.remove('active');
+            updateStatus(false);
+        }
+        
+        function toggleTotemMode() {
+            isTotemMode = !isTotemMode;
+            document.body.classList.toggle('totem-mode', isTotemMode);
+            
+            // En modo totem, ocultar cursor después de 3 segundos
+            if (isTotemMode) {
+                let cursorTimeout;
+                document.body.style.cursor = 'none';
+                
+                document.addEventListener('mousemove', () => {
+                    document.body.style.cursor = 'default';
+                    clearTimeout(cursorTimeout);
+                    cursorTimeout = setTimeout(() => {
+                        if (isTotemMode) {
+                            document.body.style.cursor = 'none';
+                        }
+                    }, 3000);
+                });
+            } else {
+                document.body.style.cursor = 'default';
+            }
+        }
+        
+        // Tecla ESC para salir del modo totem
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && isTotemMode) {
+                toggleTotemMode();
+            }
+        });
+        
+        // Auto-reconectar si se pierde la conexión
+        setInterval(() => {
+            if (!ws || ws.readyState === WebSocket.CLOSED) {
+                const startBtn = document.getElementById('startBtn');
+                if (startBtn.disabled) {
+                    console.log('Intentando reconectar...');
+                    start();
+                }
+            }
+        }, 5000);
+    </script>
+</body>
+</html>
