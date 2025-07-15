@@ -78,7 +78,7 @@ class UltraFastDiffusion:
             self.pipe.enable_xformers_memory_efficient_attention()
             print("✓ XFormers habilitado")
         except Exception as e:
-            print(f"⚠ XFormers no disponible: {e}, intentando torch.compile...")
+            print(f"⚠ XFormers no disponible: {e}")
             try:
                 torch._dynamo.config.suppress_errors = True
                 self.pipe.unet = torch.compile(self.pipe.unet, mode="reduce-overhead", fullgraph=False)
@@ -98,8 +98,8 @@ class UltraFastDiffusion:
         
         try:
             with torch.no_grad(), torch.cuda.amp.autocast():
-                # <-- CORREGIDO: Añadir negative_prompt=None para evitar el error de TensorList
-                _ = self.pipe("test", image=dummy_image, num_inference_steps=1, strength=0.5, guidance_scale=0.0, negative_prompt=None).images[0]
+                # <-- CORREGIDO: Usar 2 pasos para que 'strength' funcione correctamente.
+                _ = self.pipe("test", image=dummy_image, num_inference_steps=2, strength=0.5, guidance_scale=0.0, negative_prompt=None).images[0]
             print("✓ Pre-calentamiento exitoso")
         except Exception as e:
             print(f"⚠ Error en pre-calentamiento: {e}")
@@ -146,11 +146,11 @@ class UltraFastDiffusion:
                 
                 try:
                     with torch.no_grad(), torch.cuda.amp.autocast():
-                        # <-- CORREGIDO: Añadir negative_prompt=None aquí también
+                        # <-- CORREGIDO: Usar 2 pasos aquí también para la consistencia y estabilidad.
                         result = self.pipe(
                             prompt=frame_data['prompt'],
                             image=frame_data['image'],
-                            num_inference_steps=1,
+                            num_inference_steps=2,
                             strength=frame_data['strength'],
                             guidance_scale=frame_data['guidance_scale'],
                             negative_prompt=None,
@@ -217,6 +217,7 @@ class UltraFastDiffusion:
 
 processor = UltraFastDiffusion()
 
+# El HTML y el resto del código Python permanecen sin cambios.
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html>
@@ -484,11 +485,10 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*70)
-    print("🚀 SD-TURBO STREAM SERVER (VERSIÓN INTERACTIVA Y ESTABLE)")
+    print("🚀 SD-TURBO STREAM SERVER (VERSIÓN FINAL ESTABLE)")
     print("="*70)
-    print("⚡ SD-Turbo con 1 paso de inferencia")
+    print("⚡ Usando 2 pasos de inferencia para un control de 'strength' robusto.")
     print("🎮 Controles de Strength, Guidance y Prompt en tiempo real")
-    print("🔧 Corregido el error 'stack expects a non-empty TensorList'")
     print("🌐 URL: http://0.0.0.0:8000")
     print("="*70 + "\n")
     
