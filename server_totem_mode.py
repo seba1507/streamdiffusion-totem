@@ -667,8 +667,8 @@ HTML_CONTENT = """
         
         <div class="control-group">
             <div class="control-label">Intensidad de Transformación</div>
-            <input type="range" id="strengthSlider" min="0.3" max="1.0" step="0.1" value="0.8" oninput="updateStrengthValue()">
-            <div class="range-value" id="strengthValue">0.8</div>
+            <input type="range" id="strengthSlider" min="0.3" max="1.0" step="0.01" value="0.8" oninput="updateStrengthValue()">
+            <div class="range-value" id="strengthValue">0.80</div>
         </div>
         
         <div class="control-group">
@@ -694,8 +694,8 @@ HTML_CONTENT = """
         let latencies = [];
         
         function updateStrengthValue() {
-            const value = document.getElementById('strengthSlider').value;
-            document.getElementById('strengthValue').textContent = value;
+            const value = parseFloat(document.getElementById('strengthSlider').value);
+            document.getElementById('strengthValue').textContent = value.toFixed(2);
         }
         
         function updateGuidanceValue() {
